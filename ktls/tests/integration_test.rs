@@ -741,3 +741,92 @@ async fn ktls_server_rustls_client(
     };
     tokio::join!(server, client)
 }
+
+/// When the send buffer is full, shutdown must keep retrying the
+/// close_notify (Pending) rather than failing with WouldBlock — and the
+/// alert must actually reach the peer once the buffer drains.
+#[tokio::test]
+async fn shutdown_retries_close_notify_when_send_buffer_full() {
+    let cipher_suite = KtlsCipherSuite {
+        version: KtlsVersion::TLS13,
+        typ: KtlsCipherType::AesGcm128,
+    };
+
+    let ckey = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+
+    let mut server_config =
+        ServerConfig::builder_with_provider(single_suite_provider(cipher_suite))
+            .with_protocol_versions(&[cipher_suite.version.as_supported_version()])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![ckey.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(ckey.key_pair.serialize_der()).into(),
+            )
+            .unwrap();
+    server_config.enable_secret_extraction = true;
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let ln = TcpListener::bind("[::]:0").await.unwrap();
+    let addr = ln.local_addr().unwrap();
+
+    let mut root_store = RootCertStore::empty();
+    root_store.add(ckey.cert.der().clone()).unwrap();
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let tls_connector = TlsConnector::from(Arc::new(client_config));
+
+    let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let jh = tokio::spawn(async move {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut stream = tls_connector
+            .connect("localhost".try_into().unwrap(), stream)
+            .await
+            .unwrap();
+
+        // 3. Drain everything; the stream must end with a clean EOF,
+        // proving the close_notify eventually made it out.
+        drain_rx.await.unwrap();
+        let mut sink = vec![0u8; 65536];
+        loop {
+            match stream.read(&mut sink).await.unwrap() {
+                0 => break,
+                _ => continue,
+            }
+        }
+    });
+
+    let (stream, _) = ln.accept().await.unwrap();
+    socket2::SockRef::from(&stream)
+        .set_send_buffer_size(4096)
+        .unwrap();
+    let stream = CorkStream::new(stream);
+    let stream = acceptor.accept(stream).await.unwrap();
+    let mut stream = ktls::config_ktls_server(stream).await.unwrap();
+
+    // 1. Fill the send buffer (the client is not reading yet).
+    let chunk = vec![0u8; 65536];
+    loop {
+        match tokio::time::timeout(Duration::from_millis(250), stream.write(&chunk)).await {
+            Ok(res) => {
+                res.unwrap();
+            }
+            Err(_) => break,
+        }
+    }
+
+    // 2. With no room for the alert, shutdown must stay pending, not fail.
+    let res = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+    assert!(
+        res.is_err(),
+        "shutdown must stay pending while the buffer is full, got {res:?}"
+    );
+
+    // 4. Once the client drains, the retried shutdown completes.
+    drain_tx.send(()).unwrap();
+    stream.shutdown().await.unwrap();
+
+    jh.await.unwrap();
+}

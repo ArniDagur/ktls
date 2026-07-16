@@ -323,9 +323,19 @@ where
         if !*this.write_closed {
             // they didn't hang up on us, we're nicely being asked to shut down,
             // let's send a close_notify (and not wait for them to send it back)
-            *this.write_closed = true;
-            if let Err(e) = crate::ffi::send_close_notify(this.inner.as_raw_fd()) {
-                return Err(e).into();
+            match crate::ffi::send_close_notify(this.inner.as_raw_fd()) {
+                Ok(()) => *this.write_closed = true,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // The send buffer is full. Leave `write_closed` unset so
+                    // the alert is retried; see the FIXME in poll_read about
+                    // waking ourselves.
+                    cx.waker().wake_by_ref();
+                    return task::Poll::Pending;
+                }
+                Err(e) => {
+                    *this.write_closed = true;
+                    return Err(e).into();
+                }
             }
         }
 
