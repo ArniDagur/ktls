@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task;
 
 use nix::errno::Errno;
-use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrIn, TlsGetRecordType, recvmsg};
+use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrIn, TlsGetRecordType};
 use num_enum::FromPrimitive;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -21,6 +21,7 @@ pin_project_lite::pin_project! {
         write_closed: bool,
         read_closed: bool,
         drained: Option<(usize, Vec<u8>)>,
+        rekey: Option<crate::rekey::RekeyState>,
     }
 }
 
@@ -34,7 +35,13 @@ where
             write_closed: false,
             read_closed: false,
             drained: drained.map(|drained| (0, drained)),
+            rekey: None,
         }
+    }
+
+    pub(crate) fn with_rekey(mut self, rekey: Option<crate::rekey::RekeyState>) -> Self {
+        self.rekey = rekey;
+        self
     }
 
     /// Return the drained data + the original I/O
@@ -68,6 +75,26 @@ enum TlsAlertDescription {
     CloseNotify = 0,
     #[num_enum(catch_all)]
     Other(u8),
+}
+
+/// The error reads fail with when a peer KeyUpdate cannot be honored, either
+/// because no rekey state is configured or because the kernel predates rekey
+/// support (Linux 6.13; older kernels refuse the second setsockopt).
+fn key_update_unsupported(cause: Option<io::Error>) -> io::Error {
+    match cause {
+        None => io::Error::new(
+            io::ErrorKind::Unsupported,
+            "peer sent a TLS 1.3 KeyUpdate, which is currently unsupported by the ktls crate",
+        ),
+        Some(e) if e.raw_os_error() == Some(libc::EBUSY) => io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "peer sent a TLS 1.3 KeyUpdate but the kernel does not support \
+                 rekeying (Linux 6.13+ required): {e}"
+            ),
+        ),
+        Some(e) => e,
+    }
 }
 
 impl<IO> AsyncRead for KtlsStream<IO>
@@ -226,19 +253,52 @@ where
                     }
                     TlsGetRecordType::Handshake => {
                         // https://www.rfc-editor.org/info/rfc9846/#appendix-B.3
+                        //
+                        // Post-handshake messages. NewSessionTicket is safe to
+                        // ignore. KeyUpdate is handled by installing the
+                        // next-generation key into the kernel (Linux 6.13+);
+                        // without rekey state or kernel support it is fatal:
+                        // every read after the peer rekeys would fail to
+                        // decrypt, so surface a clear error now.
                         const MSG_NEW_SESSION_TICKET: u8 = 4;
                         const MSG_KEY_UPDATE: u8 = 24;
-                        let message_type = r.iovs().next().and_then(|iov| iov.first());
-                        match message_type {
+                        match r
+                            .iovs()
+                            .next()
+                            .and_then(|iov| iov.first())
+                        {
                             Some(&MSG_KEY_UPDATE) => {
-                                // KeyUpdate is fatal: This crate cannot switch traffic
-                                // keys, so every read after the peer rekeys would fail
-                                // to decrypt. Recent kernels (6.14+) support rekeying,
-                                // but it's not implemented here.
-                                return task::Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::Unsupported,
-                                    "peer sent a TLS 1.3 KeyUpdate, which is currently unsupported by the ktls crate",
-                                )));
+                                let state = match this.rekey.as_mut() {
+                                    Some(state) => state,
+                                    None => {
+                                        return task::Poll::Ready(Err(key_update_unsupported(
+                                            None,
+                                        )));
+                                    }
+                                };
+                                let fd = this.inner.as_raw_fd();
+                                if let Err(e) = state.rekey_rx(fd) {
+                                    return task::Poll::Ready(Err(key_update_unsupported(Some(e))));
+                                }
+                                // request_update: the peer asked us to rekey
+                                // our direction too.
+                                let requested = r
+                                    .iovs()
+                                    .next()
+                                    .and_then(|iov| iov.get(4))
+                                    == Some(&1);
+                                if requested {
+                                    match state.rekey_tx(fd) {
+                                        Ok(()) => {}
+                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                            // No room for our KeyUpdate reply;
+                                            // retried from poll_write/poll_shutdown.
+                                            state.pending_tx = true;
+                                        }
+                                        Err(e) => return task::Poll::Ready(Err(e)),
+                                    }
+                                }
+                                tracing::trace!("processed TLS 1.3 KeyUpdate");
                             }
                             Some(&MSG_NEW_SESSION_TICKET) => {
                                 // NewSessionTicket is safe to ignore: A ticket only
@@ -303,11 +363,28 @@ where
         cx: &mut task::Context<'_>,
         buf: &[u8],
     ) -> task::Poll<io::Result<usize>> {
-        if self.write_closed {
+        let this = self.project();
+
+        if *this.write_closed {
             return task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
 
-        self.project().inner.poll_write(cx, buf)
+        // An owed KeyUpdate reply must precede any further data so the peer
+        // can locate our key switch in the record stream.
+        if let Some(state) = this.rekey.as_mut() {
+            if state.pending_tx {
+                match state.rekey_tx(this.inner.as_raw_fd()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        cx.waker().wake_by_ref();
+                        return task::Poll::Pending;
+                    }
+                    Err(e) => return task::Poll::Ready(Err(e)),
+                }
+            }
+        }
+
+        this.inner.poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<io::Result<()>> {
@@ -319,6 +396,20 @@ where
         cx: &mut task::Context<'_>,
     ) -> task::Poll<io::Result<()>> {
         let this = self.project();
+
+        // An owed KeyUpdate reply precedes the close_notify.
+        if let Some(state) = this.rekey.as_mut() {
+            if state.pending_tx && !*this.write_closed {
+                match state.rekey_tx(this.inner.as_raw_fd()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        cx.waker().wake_by_ref();
+                        return task::Poll::Pending;
+                    }
+                    Err(e) => return Err(e).into(),
+                }
+            }
+        }
 
         if !*this.write_closed {
             // they didn't hang up on us, we're nicely being asked to shut down,

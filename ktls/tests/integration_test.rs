@@ -640,34 +640,84 @@ async fn read_returns_eof_when_close_notify_reply_would_block() {
     jh.await.unwrap();
 }
 
-/// The kernel cannot switch traffic keys, so a peer-initiated TLS 1.3
-/// KeyUpdate must fail reads with a clear error instead of the opaque
-/// decrypt failures every later read would produce.
+/// Whether this kernel supports kTLS rekeying (Linux 6.13+).
+fn kernel_supports_rekey() -> bool {
+    let rel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut parts = rel.trim().split(|c: char| !c.is_ascii_digit());
+    let major: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let minor: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    (major, minor) >= (6, 13)
+}
+
+/// On a rekey-capable kernel (6.13+), a peer KeyUpdate is transparent in
+/// both directions: the peer's next-generation records decrypt (RX rekey),
+/// and our reply + key switch produce records the peer accepts (TX rekey).
 #[tokio::test]
-async fn key_update_fails_reads_with_clear_error() {
+async fn key_update_rekeys_transparently() {
+    if !kernel_supports_rekey() {
+        eprintln!("kernel lacks TLS rekey support (needs 6.13+); skipping");
+        return;
+    }
+
     let cipher_suite = KtlsCipherSuite {
         version: KtlsVersion::TLS13,
         typ: KtlsCipherType::AesGcm128,
     };
-
     let (mut server, mut client) = ktls_server_rustls_client(cipher_suite).await;
 
-    // 1. Sanity round trip before the rekey.
+    // 1. Sanity round trip on generation 0.
     client.write_all(b"hello").await.unwrap();
     client.flush().await.unwrap();
-    let mut buf = [0u8; 5];
-    server.read_exact(&mut buf).await.unwrap();
-    assert_eq!(&buf, b"hello");
+    let mut buf = [0u8; 7];
+    server.read_exact(&mut buf[..5]).await.unwrap();
+    assert_eq!(&buf[..5], b"hello");
 
-    // 2. The client rekeys, then writes with the new keys.
+    // 2. The client rekeys (update_requested) and writes on generation 1.
     client.get_mut().1.refresh_traffic_keys().unwrap();
     client.write_all(b"rekeyed").await.unwrap();
     client.flush().await.unwrap();
 
-    // 3. The server's next read must report the KeyUpdate clearly.
+    // 3. RX rekey: the server reads the generation-1 data transparently.
+    server.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"rekeyed");
+
+    // 4. TX rekey: the server's reply rides its own generation-1 key; the
+    // client (rustls) accepts it only if our KeyUpdate + key switch were
+    // correct.
+    server.write_all(b"pong").await.unwrap();
+    server.flush().await.unwrap();
+    let mut buf = [0u8; 4];
+    client.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"pong");
+}
+
+/// On kernels without rekey support, a KeyUpdate with rekeying configured
+/// must still fail with the clear `Unsupported` error, not opaque EIO.
+#[tokio::test]
+async fn key_update_with_rekey_fails_clearly_on_old_kernels() {
+    if kernel_supports_rekey() {
+        eprintln!("kernel supports TLS rekey; skipping the fallback test");
+        return;
+    }
+
+    let cipher_suite = KtlsCipherSuite {
+        version: KtlsVersion::TLS13,
+        typ: KtlsCipherType::AesGcm128,
+    };
+    let (mut server, mut client) = ktls_server_rustls_client(cipher_suite).await;
+
+    client.write_all(b"hello").await.unwrap();
+    client.flush().await.unwrap();
+    let mut buf = [0u8; 5];
+    server.read_exact(&mut buf).await.unwrap();
+
+    client.get_mut().1.refresh_traffic_keys().unwrap();
+    client.write_all(b"rekeyed").await.unwrap();
+    client.flush().await.unwrap();
+
     let err = server.read(&mut buf).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
-    assert!(err.to_string().contains("KeyUpdate"), "{err}");
+    assert!(err.to_string().contains("6.13"), "{err}");
 }
 
 #[tokio::test]

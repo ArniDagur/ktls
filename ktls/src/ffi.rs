@@ -229,17 +229,20 @@ impl CryptoInfo {
 }
 
 pub fn setup_tls_info(fd: RawFd, dir: Direction, info: CryptoInfo) -> Result<(), crate::Error> {
+    set_tls_info(fd, dir, info).map_err(crate::Error::TlsCryptoInfoError)
+}
+
+pub(crate) fn set_tls_info(fd: RawFd, dir: Direction, info: CryptoInfo) -> std::io::Result<()> {
     let ret = unsafe { libc::setsockopt(fd, SOL_TLS, dir.into(), info.as_ptr(), info.size() as _) };
     if ret < 0 {
-        return Err(crate::Error::TlsCryptoInfoError(
-            std::io::Error::last_os_error(),
-        ));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
 const TLS_SET_RECORD_TYPE: libc::c_int = 1;
 const ALERT: u8 = 0x15;
+const HANDSHAKE: u8 = 0x16;
 
 // Yes, really. cmsg components are aligned to [libc::c_long]
 #[cfg_attr(target_pointer_width = "32", repr(C, align(4)))]
@@ -270,7 +273,16 @@ pub fn send_close_notify(fd: RawFd) -> std::io::Result<()> {
         .payload
         .encode(&mut data);
 
-    let mut cmsg = Cmsg::new(SOL_TLS, TLS_SET_RECORD_TYPE, [ALERT]);
+    send_record(fd, ALERT, data)
+}
+
+/// Send the handshake-typed `payload` as a single TLS record.
+pub(crate) fn send_handshake_record(fd: RawFd, payload: &[u8]) -> std::io::Result<()> {
+    send_record(fd, HANDSHAKE, payload.to_vec())
+}
+
+fn send_record(fd: RawFd, record_type: u8, mut data: Vec<u8>) -> std::io::Result<()> {
+    let mut cmsg = Cmsg::new(SOL_TLS, TLS_SET_RECORD_TYPE, [record_type]);
 
     let msg = libc::msghdr {
         msg_name: std::ptr::null_mut(),

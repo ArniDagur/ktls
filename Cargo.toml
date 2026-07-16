@@ -9,3 +9,8 @@ authors = ["Amos Wenger <amos@bearcove.net>"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/rustls/ktls"
+
+# Until rustls exposes dangerous_into_kernel_connection on buffered
+# connections (PR pending), use the patched checkout.
+[patch.crates-io]
+rustls = { path = "../rustls/rustls" }

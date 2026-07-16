@@ -7,6 +7,7 @@ mod async_read_ready;
 mod cork_stream;
 mod ffi;
 mod ktls_stream;
+mod rekey;
 
 use std::future::Future;
 use std::io;
@@ -27,7 +28,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub use crate::async_read_ready::AsyncReadReady;
 pub use crate::cork_stream::CorkStream;
 pub use crate::ffi::CryptoInfo;
-use crate::ffi::{KtlsCompatibilityError, setup_tls_info, setup_ulp};
+use crate::ffi::{setup_tls_info, setup_ulp, KtlsCompatibilityError};
 pub use crate::ktls_stream::KtlsStream;
 
 #[derive(Debug, Default)]
@@ -254,8 +255,8 @@ where
     let (io, conn) = stream.into_inner();
     let io = io.io;
 
-    setup_inner(io.as_raw_fd(), Connection::Server(conn))?;
-    Ok(KtlsStream::new(io, drained))
+    let rekey = setup_inner(io.as_raw_fd(), Connection::Server(conn))?;
+    Ok(KtlsStream::new(io, drained).with_rekey(Some(rekey)))
 }
 
 /// Configure kTLS for this socket. If this call succeeds, data can be
@@ -277,8 +278,8 @@ where
     let (io, conn) = stream.into_inner();
     let io = io.io;
 
-    setup_inner(io.as_raw_fd(), Connection::Client(conn))?;
-    Ok(KtlsStream::new(io, drained))
+    let rekey = setup_inner(io.as_raw_fd(), Connection::Client(conn))?;
+    Ok(KtlsStream::new(io, drained).with_rekey(Some(rekey)))
 }
 
 /// Read all the bytes we can read without blocking. This is used to drained the
@@ -323,18 +324,24 @@ async fn drain(stream: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<
     Ok(maybe_drained)
 }
 
-fn setup_inner(fd: RawFd, conn: Connection) -> Result<(), Error> {
-    let cipher_suite = match conn.negotiated_cipher_suite() {
-        Some(cipher_suite) => cipher_suite,
-        None => {
-            return Err(Error::NoNegotiatedCipherSuite);
-        }
-    };
+fn setup_inner(fd: RawFd, conn: Connection) -> Result<rekey::RekeyState, Error> {
+    if conn.negotiated_cipher_suite().is_none() {
+        return Err(Error::NoNegotiatedCipherSuite);
+    }
 
-    let secrets = match conn.dangerous_extract_secrets() {
-        Ok(secrets) => secrets,
-        Err(err) => return Err(Error::ExportSecrets(err)),
+    // The kernel connection retains the key schedule, letting rustls compute
+    // next-generation traffic secrets when a TLS 1.3 KeyUpdate happens.
+    let (secrets, kernel_conn) = match conn {
+        Connection::Client(conn) => conn
+            .dangerous_into_kernel_connection()
+            .map(|(secrets, conn)| (secrets, rekey::KernelConn::Client(conn)))
+            .map_err(Error::ExportSecrets)?,
+        Connection::Server(conn) => conn
+            .dangerous_into_kernel_connection()
+            .map(|(secrets, conn)| (secrets, rekey::KernelConn::Server(conn)))
+            .map_err(Error::ExportSecrets)?,
     };
+    let cipher_suite = kernel_conn.negotiated_cipher_suite();
 
     ffi::setup_ulp(fd).map_err(Error::UlpError)?;
 
@@ -344,7 +351,7 @@ fn setup_inner(fd: RawFd, conn: Connection) -> Result<(), Error> {
     let rx = CryptoInfo::from_rustls(cipher_suite, secrets.rx)?;
     setup_tls_info(fd, ffi::Direction::Rx, rx)?;
 
-    Ok(())
+    Ok(rekey::RekeyState::new(kernel_conn, cipher_suite))
 }
 
 /// TLS versions supported by this crate
