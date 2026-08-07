@@ -889,7 +889,9 @@ async fn shutdown_retries_close_notify_when_send_buffer_full() {
 
     let mut server_config =
         ServerConfig::builder_with_provider(single_suite_provider(cipher_suite))
-            .with_protocol_versions(&[cipher_suite.version.as_supported_version()])
+            .with_protocol_versions(&[cipher_suite
+                .version
+                .as_supported_version()])
             .unwrap()
             .with_no_client_auth()
             .with_single_cert(
@@ -900,11 +902,15 @@ async fn shutdown_retries_close_notify_when_send_buffer_full() {
     server_config.enable_secret_extraction = true;
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-    let ln = TcpListener::bind("[::]:0").await.unwrap();
+    let ln = TcpListener::bind("[::]:0")
+        .await
+        .unwrap();
     let addr = ln.local_addr().unwrap();
 
     let mut root_store = RootCertStore::empty();
-    root_store.add(ckey.cert.der().clone()).unwrap();
+    root_store
+        .add(ckey.cert.der().clone())
+        .unwrap();
     let client_config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
@@ -937,7 +943,9 @@ async fn shutdown_retries_close_notify_when_send_buffer_full() {
         .unwrap();
     let stream = CorkStream::new(stream);
     let stream = acceptor.accept(stream).await.unwrap();
-    let mut stream = ktls::config_ktls_server(stream).await.unwrap();
+    let mut stream = ktls::config_ktls_server(stream)
+        .await
+        .unwrap();
 
     // 1. Fill the send buffer (the client is not reading yet).
     let chunk = vec![0u8; 65536];
