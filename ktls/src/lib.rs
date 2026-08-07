@@ -4,6 +4,7 @@ compile_error!("This crate needs wither the 'ring' or 'aws_lc_rs' feature enable
 compile_error!("The 'ring' and 'aws_lc_rs' features are mutually exclusive");
 
 mod async_read_ready;
+mod async_write_ready;
 mod cork_stream;
 mod ffi;
 mod ktls_stream;
@@ -25,6 +26,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
 pub use crate::async_read_ready::AsyncReadReady;
+pub use crate::async_write_ready::AsyncWriteReady;
 pub use crate::cork_stream::CorkStream;
 pub use crate::ffi::CryptoInfo;
 use crate::ffi::{setup_tls_info, setup_ulp, KtlsCompatibilityError};
